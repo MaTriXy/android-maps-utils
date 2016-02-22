@@ -1,3 +1,19 @@
+/*
+ * Copyright 2013 Google Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.maps.android.clustering.view;
 
 import android.animation.Animator;
@@ -40,8 +56,9 @@ import com.google.maps.android.ui.SquareTextView;
 import com.google.maps.android.ui.IconGenerator;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -69,7 +86,8 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
     /**
      * Markers that are currently on the map.
      */
-    private Set<MarkerWithPosition> mMarkers = new HashSet<MarkerWithPosition>();
+    private Set<MarkerWithPosition> mMarkers = Collections.newSetFromMap(
+            new ConcurrentHashMap<MarkerWithPosition, Boolean>());
 
     /**
      * Icons for each bucket.
@@ -95,6 +113,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
      * Lookup between markers and the associated cluster.
      */
     private Map<Marker, Cluster<T>> mMarkerToCluster = new HashMap<Marker, Cluster<T>>();
+    private Map<Cluster<T>, Marker> mClusterToMarker = new HashMap<Cluster<T>, Marker>();
 
     /**
      * The target zoom level for the current set of clusters.
@@ -179,7 +198,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         return squareTextView;
     }
 
-    private int getColor(int clusterSize) {
+    protected int getColor(int clusterSize) {
         final float hueRange = 220;
         final float sizeRange = 300;
         final float size = Math.min(clusterSize, sizeRange);
@@ -245,6 +264,11 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
                 // Nothing to do.
                 return;
             }
+            Projection projection = mMap.getProjection();
+            if (projection == null) {
+                // Without a map projection we can't render clusters.
+                return;
+            }
 
             RenderTask renderTask;
             synchronized (this) {
@@ -259,7 +283,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
                     sendEmptyMessage(TASK_FINISHED);
                 }
             });
-            renderTask.setProjection(mMap.getProjection());
+            renderTask.setProjection(projection);
             renderTask.setMapZoom(mMap.getCameraPosition().zoom);
             new Thread(renderTask).start();
         }
@@ -358,7 +382,8 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             }
 
             // Create the new markers and animate them to their new positions.
-            final Set<MarkerWithPosition> newMarkers = new HashSet<MarkerWithPosition>();
+            final Set<MarkerWithPosition> newMarkers = Collections.newSetFromMap(
+                    new ConcurrentHashMap<MarkerWithPosition, Boolean>());
             for (Cluster<T> c : clusters) {
                 boolean onScreen = visibleBounds.contains(c.getPosition());
                 if (zoomingIn && onScreen && SHOULD_ANIMATE) {
@@ -610,6 +635,8 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         }
 
         private void removeMarker(Marker m) {
+            Cluster<T> cluster = mMarkerToCluster.get(m);
+            mClusterToMarker.remove(cluster);
             mMarkerCache.remove(m);
             mMarkerToCluster.remove(m);
             mClusterManager.getMarkerManager().remove(m);
@@ -619,10 +646,15 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
          * @return true if there is still work to be processed.
          */
         public boolean isBusy() {
-            return !(mCreateMarkerTasks.isEmpty() && mOnScreenCreateMarkerTasks.isEmpty() &&
-                    mOnScreenRemoveMarkerTasks.isEmpty() && mRemoveMarkerTasks.isEmpty() &&
-                    mAnimationTasks.isEmpty()
-            );
+            try {
+                lock.lock();
+                return !(mCreateMarkerTasks.isEmpty() && mOnScreenCreateMarkerTasks.isEmpty() &&
+                        mOnScreenRemoveMarkerTasks.isEmpty() && mRemoveMarkerTasks.isEmpty() &&
+                        mAnimationTasks.isEmpty()
+                );
+            } finally {
+                lock.unlock();
+            }
         }
 
         /**
@@ -715,6 +747,42 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
      */
     protected void onClusterItemRendered(T clusterItem, Marker marker) {
     }
+    
+    /**
+     * Get the marker from a ClusterItem
+     * @param clusterItem ClusterItem which you will obtain its marker
+     * @return a marker from a ClusterItem or null if it does not exists
+     */
+    public Marker getMarker(T  clusterItem) {
+        return mMarkerCache.get(clusterItem);
+    }
+
+    /**
+     * Get the ClusterItem from a marker
+     * @param marker which you will obtain its ClusterItem
+     * @return a ClusterItem from a marker or null if it does not exists
+     */
+    public T getClusterItem(Marker marker) {
+        return mMarkerCache.get(marker);
+    }
+
+    /**
+     * Get the marker from a Cluster
+     * @param cluster which you will obtain its marker
+     * @return a marker from a cluster or null if it does not exists
+     */
+    public Marker getMarker(Cluster<T>  cluster) {
+        return mClusterToMarker.get(cluster);
+    }
+
+    /**
+     * Get the Cluster from a marker
+     * @param marker which you will obtain its Cluster
+     * @return a Cluster from a marker or null if it does not exists
+     */
+    public Cluster<T> getCluster(Marker marker) {
+        return mMarkerToCluster.get(marker);
+    }
 
     /**
      * Creates markerWithPosition(s) for a particular cluster, animating it if necessary.
@@ -772,6 +840,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
 
             Marker marker = mClusterManager.getClusterMarkerCollection().addMarker(markerOptions);
             mMarkerToCluster.put(marker, cluster);
+            mClusterToMarker.put(cluster, marker);
             MarkerWithPosition markerWithPosition = new MarkerWithPosition(marker);
             if (animateFrom != null) {
                 markerModifier.animate(markerWithPosition, animateFrom, cluster.getPosition());
@@ -841,6 +910,8 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         @Override
         public void onAnimationEnd(Animator animation) {
             if (mRemoveOnComplete) {
+                Cluster<T> cluster = mMarkerToCluster.get(marker);
+                mClusterToMarker.remove(cluster);
                 mMarkerCache.remove(marker);
                 mMarkerToCluster.remove(marker);
                 mMarkerManager.remove(marker);
